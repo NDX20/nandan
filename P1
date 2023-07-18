@@ -1,0 +1,157 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Hyperparameters
+latent_size = 100
+hidden_size = 64
+image_size = 64
+num_epochs = 50
+batch_size = 128
+learning_rate = 0.0002
+beta1 = 0.5
+
+# Create a custom weights initialization function
+def weights_init(m):
+    classname = m._class.name_
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+
+# Generator model
+class Generator(nn.Module):
+    def _init_(self):
+        super(Generator, self)._init_()
+        self.main = nn.Sequential(
+            nn.ConvTranspose2d(latent_size, hidden_size * 8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(hidden_size * 8),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(hidden_size * 8, hidden_size * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(hidden_size * 4),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(hidden_size * 4, hidden_size * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(hidden_size * 2),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(hidden_size * 2, hidden_size, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(hidden_size),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(hidden_size, 3, 4, 2, 1, bias=False),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        return self.main(x)
+
+# Discriminator model
+class Discriminator(nn.Module):
+    def _init_(self):
+        super(Discriminator, self)._init_()
+        self.main = nn.Sequential(
+            nn.Conv2d(3, hidden_size, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(hidden_size, hidden_size * 2, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(hidden_size * 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(hidden_size * 2, hidden_size * 4, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(hidden_size * 4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(hidden_size * 4, hidden_size * 8, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(hidden_size * 8),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(hidden_size * 8, 1, 4, 1, 0, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.main(x).view(-1, 1).squeeze(1)
+
+# Initialize generator and discriminator
+generator = Generator().to(device)
+discriminator = Discriminator().to(device)
+
+# Apply custom weights initialization
+generator.apply(weights_init)
+discriminator.apply(weights_init)
+
+# Loss function
+criterion = nn.BCELoss()
+
+# Optimizers
+optimizer_G = optim.Adam(generator.parameters(), lr=learning_rate, betas=(beta1, 0.999))
+optimizer_D = optim.Adam(discriminator.parameters(), lr=learning_rate, betas=(beta1, 0.999))
+
+# Dataset and dataloader
+dataset = datasets.ImageFolder(root='path_to_dataset',
+                               transform=transforms.Compose([
+                                   transforms.Resize(image_size),
+                                   transforms.CenterCrop(image_size),
+                                   transforms.ToTensor(),
+                                   transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+                               ]))
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+
+# Tensorboard writer
+writer = SummaryWriter()
+
+# Training loop
+total_steps = 0
+for epoch in range(num_epochs):
+    for i, (real_images, _) in enumerate(dataloader):
+        real_images = real_images.to(device)
+        batch_size = real_images.size(0)
+        
+        # Label tensors
+        real_labels = torch.ones(batch_size, device=device)
+        fake_labels = torch.zeros(batch_size, device=device)
+        
+        # Train discriminator
+        discriminator.zero_grad()
+        real_output = discriminator(real_images)
+        real_loss = criterion(real_output, real_labels)
+        real_score = torch.mean(real_output).item()
+        
+        noise = torch.randn(batch_size, latent_size, 1, 1, device=device)
+        fake_images = generator(noise)
+        fake_output = discriminator(fake_images.detach())
+        fake_loss = criterion(fake_output, fake_labels)
+        fake_score = torch.mean(fake_output).item()
+        
+        d_loss = real_loss + fake_loss
+        d_loss.backward()
+        optimizer_D.step()
+        
+        # Train generator
+        generator.zero_grad()
+        fake_output = discriminator(fake_images)
+        g_loss = criterion(fake_output, real_labels)
+        g_loss.backward()
+        optimizer_G.step()
+        
+        # Print training progress
+        if (i+1) % 10 == 0:
+            print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(dataloader)}], "
+                  f"D_loss: {d_loss.item():.4f}, G_loss: {g_loss.item():.4f}, "
+                  f"D(x): {real_score:.2f}, D(G(z)): {fake_score:.2f}")
+        
+        # Tensorboard logging
+        writer.add_scalar('Loss/Discriminator', d_loss.item(), total_steps)
+        writer.add_scalar('Loss/Generator', g_loss.item(), total_steps)
+        total_steps += 1
+        
+        # Save generated images for every 100 steps
+        if total_steps % 100 == 0:
+            with torch.no_grad():
+                fake_images = generator(fixed_noise).detach().cpu()
+            writer.add_images('Generated Images', fake_images, total_steps, dataformats='NCHW')
+
+# Save the trained models
+torch.save(generator.state_dict(), 'generator.pth')
+torch.save(discriminator.state_dict(), 'discriminator.pth')
